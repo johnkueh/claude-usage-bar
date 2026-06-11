@@ -1,0 +1,132 @@
+#!/bin/sh
+# claude-account — switch which Claude subscription this Mac's sessions/agents use,
+# by swapping the Claude Code keychain login credential between saved snapshots.
+#
+#   claude-account snapshot work   # save the CURRENTLY logged-in account's credential as 'work'
+#   claude-account work            # switch the Mac to the work account
+#   claude-account personal        # switch the Mac to the personal account
+#   claude-account status          # which account is active
+#
+# How it works: Claude Code stores its login in the macOS Keychain item
+# "Claude Code-credentials". Snapshots live at ~/.claude/.cred-<name> (chmod 600).
+# A switch first re-snapshots the live credential under the active account's name
+# (so refreshed tokens are never lost), then writes the target snapshot into the
+# keychain. New sessions/agents pick it up immediately; this is a real login, so
+# Remote Control and everything else behave exactly as after /login.
+#
+# Setup (one-time):
+#   1. claude-account snapshot <name-of-account-this-mac-is-logged-into>
+#   2. /login as the other account in any Claude session
+#   3. claude-account snapshot <other-name>
+#   Thereafter: claude-account work|personal any time.
+
+set -eu
+
+SVC="Claude Code-credentials"
+ACCT="$(whoami)"
+DIR="$HOME/.claude"
+MARKER="$DIR/.account-active"
+
+die() { echo "claude-account: $*" >&2; exit 1; }
+
+read_live() { security find-generic-password -w -s "$SVC" -a "$ACCT" 2>/dev/null; }
+
+write_live() { security add-generic-password -U -s "$SVC" -a "$ACCT" -w "$1"; }
+
+save_snapshot() { # $1=name $2=blob
+  umask 077
+  printf '%s' "$2" > "$DIR/.cred-$1"
+}
+
+case "${1:-status}" in
+  snapshot)
+    name="${2:-}"
+    [ -n "$name" ] || die "usage: claude-account snapshot <name>"
+    blob=$(read_live) || die "could not read the live credential — is Claude Code logged in?"
+    [ -n "$blob" ] || die "live credential is empty"
+    save_snapshot "$name" "$blob"
+    printf '%s' "$name" > "$MARKER"
+    echo "snapshotted live credential as '$name' (active account marker set)"
+    ;;
+  usage)
+    # Show 5-hour + weekly utilization for every snapshotted account, so you can
+    # pick an account by remaining quota without switching. Uses access tokens
+    # only (read-only); the inactive account's token can expire (~daily) — a
+    # switch to it refreshes the snapshot.
+    command -v jq >/dev/null || die "jq required"
+    active=$(cat "$MARKER" 2>/dev/null || echo "")
+    printf '%-12s %8s %8s  %s\n' "account" "5h-used" "wk-used" "weekly-resets"
+    for f in "$DIR"/.cred-*; do
+      [ -e "$f" ] || die "no snapshots found"
+      name=${f##*/.cred-}
+      if [ "$name" = "$active" ]; then
+        tok=$(read_live | jq -r '.claudeAiOauth.accessToken // empty'); tag="$name*"
+      else
+        tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$f"); tag="$name"
+      fi
+      [ -n "$tok" ] || { printf '%-12s %s\n' "$tag" "(no token)"; continue; }
+      resp=$(curl -sS --max-time 10 https://api.anthropic.com/api/oauth/usage \
+        -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20")
+      if printf '%s' "$resp" | jq -e '.seven_day' >/dev/null 2>&1; then
+        printf '%s' "$resp" | jq -r --arg n "$tag" \
+          '[$n, "\(.five_hour.utilization // 0)%", "\(.seven_day.utilization // 0)%", ((.seven_day.resets_at // "?") | sub("\\.[0-9]+";"") )] | @tsv' \
+          | awk -F'\t' '{printf "%-12s %8s %8s  %s\n", $1, $2, $3, $4}'
+      else
+        printf '%-12s %s\n' "$tag" "(token expired — switch to '$name' once to refresh it)"
+      fi
+    done
+    ;;
+  whoami)
+    # Empirically resolve which account the LIVE keychain credential belongs to,
+    # via the same OAuth profile endpoint Claude Code's /status uses. Read-only;
+    # never touches refresh tokens.
+    blob=$(read_live) || die "could not read the live credential"
+    tok=$(printf '%s' "$blob" | jq -r '.claudeAiOauth.accessToken // empty')
+    [ -n "$tok" ] || die "no claudeAiOauth access token in the live credential"
+    email=$(curl -sS --max-time 10 https://api.anthropic.com/api/oauth/profile \
+      -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" \
+      | jq -r '.account.email // .email // "unknown (token may be expired)"')
+    [ -f "$MARKER" ] && echo "marker:   $(cat "$MARKER")"
+    echo "keychain: $email"
+    ;;
+  status)
+    if [ -f "$MARKER" ]; then
+      active=$(cat "$MARKER")
+      live=$(read_live || true)
+      if [ -f "$DIR/.cred-$active" ] && [ "$live" != "$(cat "$DIR/.cred-$active")" ]; then
+        note=" (live credential has refreshed since last snapshot — normal)"
+      else
+        note=""
+      fi
+      echo "active: $active$note"
+    else
+      echo "active: unknown — run: claude-account snapshot <name> while logged into that account"
+    fi
+    ls "$DIR"/.cred-* >/dev/null 2>&1 && echo "snapshots: $(ls "$DIR"/.cred-* | sed 's|.*/\.cred-||' | tr '\n' ' ')"
+    ;;
+  *)
+    name="$1"
+    [ -f "$DIR/.cred-$name" ] || die "no snapshot for '$name' — run: claude-account snapshot $name while logged into it"
+    [ -f "$MARKER" ] || die "active account unknown — run: claude-account snapshot <current-name> first"
+    active=$(cat "$MARKER")
+    [ "$active" != "$name" ] || { echo "already on '$name'"; exit 0; }
+    # preserve the live (possibly refreshed) credential under the active name
+    blob=$(read_live) || die "could not read live credential"
+    [ -n "$blob" ] || die "live credential is empty; aborting"
+    save_snapshot "$active" "$blob"
+    write_live "$(cat "$DIR/.cred-$name")"
+    printf '%s' "$name" > "$MARKER"
+    echo "switched: Mac is now on '$name' — new sessions/agents use it (running ones keep their old account)"
+    # The `claude agents` UI caches its account at startup and stamps it onto agents
+    # it spawns — bounce it so respawns/new spawns pick up the new account. Exact
+    # cmdline match only: claimed --bg-spare session processes must NOT be touched.
+    # Never bounce when invoked from inside a Claude session (CLAUDECODE=1): killing
+    # the UI from in there takes down the session that ran the switch, and the user
+    # may not be at the computer to rerun it.
+    if [ -n "${CLAUDECODE:-}" ]; then
+      echo "inside a Claude session — left the claude agents UI running; restart it when convenient so newly-spawned agents use '$name'"
+    elif pkill -fx 'claude agents' 2>/dev/null; then
+      echo "bounced the claude agents UI (rerun \`claude agents\` to reopen on '$name'); running agents unaffected"
+    fi
+    ;;
+esac

@@ -227,6 +227,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
+        if AccountStore.accounts().isEmpty {
+            let hint = NSMenuItem(title: "No saved accounts yet", action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            menu.addItem(hint)
+            let save = NSMenuItem(title: "Save Current Login…", action: #selector(addAccount), keyEquivalent: "")
+            save.target = self
+            menu.addItem(save)
+        }
         for name in AccountStore.accounts() {
             let item = NSMenuItem(title: name, action: #selector(switchAccount(_:)), keyEquivalent: "")
             item.target = self
