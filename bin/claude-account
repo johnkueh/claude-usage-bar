@@ -132,11 +132,15 @@ case "${1:-status}" in
       write_live "$(cat "$DIR/.cred-$name")"
       run_with_timeout 60 "$claude_bin" -p 'ok' --max-turns 1 >/dev/null 2>&1 || true
       newblob=$(read_live || true)
-      if [ -n "$newblob" ]; then
+      # Only overwrite the snapshot if the refresh actually produced a credential
+      # with a non-empty access token — a failed refresh must never degrade a good
+      # (merely expired, still-refreshable) snapshot. grep, not jq, to stay
+      # PATH-independent under the menu-bar app's minimal GUI environment.
+      if printf '%s' "$newblob" | grep -Eq '"accessToken" *: *"[^"]'; then
         save_snapshot "$name" "$newblob"
         echo "refreshed '$name'"
       else
-        echo "warn: '$name' produced no credential after claude -p (left snapshot as-is)"
+        echo "warn: '$name' refresh produced no valid access token — left existing snapshot untouched"
       fi
     done
     restore_active "$active"   # belt-and-braces; trap restores again on exit
