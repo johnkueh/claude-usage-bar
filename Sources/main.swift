@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var usage: [String: UsageState] = [:]
     var lastRefresh: Date?
     var refreshing = false
+    var heartbeating = false
     var menuOpen = false
     var unknownLoginEmail: String?
     let defaults = UserDefaults.standard
@@ -128,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             guard let self else { return }
             var result: [String: UsageState] = [:]
             var liveEmail: String?
+            var expiredInactive: [String] = []
 
             for name in names {
                 guard let token = AccountStore.token(for: name) else {
@@ -140,6 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     UsageCache.save(name, usage)
                 } else {
                     result[name] = self.fallback(name, error)
+                    if error == "token expired", name != active { expiredInactive.append(name) }
                 }
                 if name == active, case .fresh = result[name]! {
                     liveEmail = UsageAPI.fetchEmail(token: token)
@@ -154,13 +157,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.updateStatusButton()
                 self.rebuildMenu()
                 self.runAutopilot()
+                self.heartbeatIfNeeded(expiredInactive)
             }
         }
     }
 
     func fallback(_ name: String, _ reason: String) -> UsageState {
         if let cached = UsageCache.load(name) { return .stale(cached, reason) }
-        return .unavailable(reason == "token expired" ? "token expired — switch once to refresh" : reason)
+        return .unavailable(reason == "token expired" ? "token expired — refreshing…" : reason)
+    }
+
+    // An inactive account's access token expires (~daily) and the app is read-only
+    // on refresh tokens, so it can't renew it directly. Instead of making the user
+    // "switch once to refresh", run `claude-account refresh <name>` in the background:
+    // it briefly loads that account's snapshot and a tiny `claude -p` renews the token.
+    // Debounced per account so a permanently-dead token can't cause a hammer loop.
+    func heartbeatIfNeeded(_ names: [String]) {
+        guard !heartbeating else { return }
+        let due = names.filter { name in
+            guard let last = defaults.object(forKey: "heartbeat-\(name)") as? Date else { return true }
+            return Date().timeIntervalSince(last) >= 1200   // at most once / 20 min per account
+        }
+        guard !due.isEmpty else { return }
+        heartbeating = true
+        due.forEach { defaults.set(Date(), forKey: "heartbeat-\($0)") }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            for name in due { _ = AccountStore.run(AccountStore.cli, ["refresh", name]) }
+            DispatchQueue.main.async {
+                self.heartbeating = false
+                self.refresh()   // re-fetch now that the token should be live again
+            }
+        }
     }
 
     // Detect a login the app doesn't know: the live credential's email differs

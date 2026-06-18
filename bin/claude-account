@@ -38,6 +38,54 @@ save_snapshot() { # $1=name $2=blob
   printf '%s' "$2" > "$DIR/.cred-$1"
 }
 
+LOCK="$DIR/.account-lock"
+lock_acquire() {
+  tries=0
+  until mkdir "$LOCK" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -gt 100 ] && die "another claude-account operation is in progress (stale lock? rm -rf '$LOCK')"
+    sleep 0.1
+  done
+}
+lock_release() { rmdir "$LOCK" 2>/dev/null || true; }
+
+# Resolve the claude binary even under a minimal GUI PATH (the menu-bar app).
+resolve_claude() {
+  if command -v claude >/dev/null 2>&1; then command -v claude; return 0; fi
+  for c in "$HOME/.local/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude; do
+    [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+# Run a command with a hard timeout (macOS has no `timeout` by default).
+run_with_timeout() { # $1=secs, rest=cmd...
+  _secs=$1; shift
+  "$@" & _cmd_pid=$!
+  ( sleep "$_secs"; kill "$_cmd_pid" 2>/dev/null ) & _killer=$!
+  wait "$_cmd_pid" 2>/dev/null; _rc=$?
+  kill "$_killer" 2>/dev/null
+  return "$_rc"
+}
+
+# Write a saved snapshot back into the live keychain (used to restore the active
+# account after a heartbeat that briefly swapped another account in).
+restore_active() { # $1=active name
+  [ -n "${1:-}" ] && [ -f "$DIR/.cred-$1" ] && write_live "$(cat "$DIR/.cred-$1")" || true
+}
+
+# Is $1 a process-ancestor of this script? Used so a bounce never kills the
+# session/app that invoked the switch.
+is_ancestor() { # $1=candidate pid
+  _p=$$
+  while [ "${_p:-0}" -gt 1 ]; do
+    [ "$_p" = "$1" ] && return 0
+    _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
+    [ -n "$_p" ] || break
+  done
+  return 1
+}
+
 case "${1:-status}" in
   snapshot)
     name="${2:-}"
@@ -47,6 +95,51 @@ case "${1:-status}" in
     save_snapshot "$name" "$blob"
     printf '%s' "$name" > "$MARKER"
     echo "snapshotted live credential as '$name' (active account marker set)"
+    ;;
+  refresh)
+    # Heartbeat: refresh an inactive account's OAuth access token WITHOUT a manual
+    # switch. For each target, briefly load its snapshot into the keychain, run a tiny
+    # `claude -p` (which makes Claude Code refresh the expired token via its refresh
+    # token and write the new credential back), re-snapshot the fresh credential, then
+    # restore the active account. The keychain is swapped only for the seconds claude -p
+    # runs; a lock guards against a concurrent switch/refresh. Default targets = all
+    # inactive accounts. This is what kills the "switch once to refresh" stale gauge.
+    shift || true
+    claude_bin=$(resolve_claude) || die "claude binary not found (looked on PATH and ~/.local/bin)"
+    [ -f "$MARKER" ] || die "active account unknown — run: claude-account snapshot <current-name> first"
+    active=$(cat "$MARKER")
+    if [ "$#" -gt 0 ]; then
+      targets="$*"
+    else
+      targets=""
+      for f in "$DIR"/.cred-*; do
+        [ -e "$f" ] || continue
+        n=${f##*/.cred-}
+        [ "$n" = "$active" ] || targets="$targets $n"
+      done
+    fi
+    [ -n "$(printf '%s' "$targets" | tr -d ' ')" ] || { echo "no inactive accounts to refresh"; exit 0; }
+
+    lock_acquire
+    trap 'restore_active "$active"; lock_release' EXIT INT TERM
+    live=$(read_live) || die "could not read live credential"
+    [ -n "$live" ] || die "live credential empty; aborting"
+    save_snapshot "$active" "$live"   # preserve active's current (possibly refreshed) cred
+
+    for name in $targets; do
+      [ "$name" = "$active" ] && { echo "skip '$name' (active — already live)"; continue; }
+      [ -f "$DIR/.cred-$name" ] || { echo "skip '$name' (no snapshot)"; continue; }
+      write_live "$(cat "$DIR/.cred-$name")"
+      run_with_timeout 60 "$claude_bin" -p 'ok' --max-turns 1 >/dev/null 2>&1 || true
+      newblob=$(read_live || true)
+      if [ -n "$newblob" ]; then
+        save_snapshot "$name" "$newblob"
+        echo "refreshed '$name'"
+      else
+        echo "warn: '$name' produced no credential after claude -p (left snapshot as-is)"
+      fi
+    done
+    restore_active "$active"   # belt-and-braces; trap restores again on exit
     ;;
   usage)
     # Show 5-hour + weekly utilization for every snapshotted account, so you can
@@ -72,7 +165,7 @@ case "${1:-status}" in
           '[$n, "\(.five_hour.utilization // 0)%", "\(.seven_day.utilization // 0)%", ((.seven_day.resets_at // "?") | sub("\\.[0-9]+";"") )] | @tsv' \
           | awk -F'\t' '{printf "%-12s %8s %8s  %s\n", $1, $2, $3, $4}'
       else
-        printf '%-12s %s\n' "$tag" "(token expired — switch to '$name' once to refresh it)"
+        printf '%-12s %s\n' "$tag" "(token expired — run: claude-account refresh $name)"
       fi
     done
     ;;
@@ -110,6 +203,8 @@ case "${1:-status}" in
     [ -f "$MARKER" ] || die "active account unknown — run: claude-account snapshot <current-name> first"
     active=$(cat "$MARKER")
     [ "$active" != "$name" ] || { echo "already on '$name'"; exit 0; }
+    lock_acquire
+    trap 'lock_release' EXIT INT TERM
     # preserve the live (possibly refreshed) credential under the active name
     blob=$(read_live) || die "could not read live credential"
     [ -n "$blob" ] || die "live credential is empty; aborting"
@@ -120,13 +215,19 @@ case "${1:-status}" in
     # The `claude agents` UI caches its account at startup and stamps it onto agents
     # it spawns — bounce it so respawns/new spawns pick up the new account. Exact
     # cmdline match only: claimed --bg-spare session processes must NOT be touched.
-    # Never bounce when invoked from inside a Claude session (CLAUDECODE=1): killing
-    # the UI from in there takes down the session that ran the switch, and the user
-    # may not be at the computer to rerun it.
-    if [ -n "${CLAUDECODE:-}" ]; then
-      echo "inside a Claude session — left the claude agents UI running; restart it when convenient so newly-spawned agents use '$name'"
-    elif pkill -fx 'claude agents' 2>/dev/null; then
-      echo "bounced the claude agents UI (rerun \`claude agents\` to reopen on '$name'); running agents unaffected"
-    fi
+    # Ancestor-aware: kill every agents UI EXCEPT one that is a process-ancestor of
+    # this switch (killing our own ancestor would take down the session/app that ran
+    # the switch). This is safe even inside a Claude session (CLAUDECODE), as long as
+    # the session wasn't launched from the very UI being bounced.
+    bounced=0 parent_ui=0
+    for pid in $(pgrep -fx 'claude agents' 2>/dev/null || true); do
+      if is_ancestor "$pid"; then
+        parent_ui=1
+      else
+        kill "$pid" 2>/dev/null && bounced=$((bounced + 1))
+      fi
+    done
+    [ "$bounced" -gt 0 ] && echo "bounced the claude agents UI ($bounced) — reopen with \`claude agents\` on '$name'; running agents unaffected"
+    [ "$parent_ui" = 1 ] && echo "the claude agents UI that launched this session is still on the old account — restart it when convenient so newly-spawned agents use '$name'"
     ;;
 esac

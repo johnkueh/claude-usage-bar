@@ -148,7 +148,8 @@ enum Render {
             title.append(NSAttributedString(string: "  ·  ", attributes: smallDim))
             title.append(gauge("wk", u.sevenDayPct, u.sevenDayReset))
             if case .stale(_, let reason) = state! {
-                title.append(NSAttributedString(string: "\n\(reason) — switch once to refresh", attributes: smallDim))
+                let note = reason == "token expired" ? "token expired — refreshing…" : reason
+                title.append(NSAttributedString(string: "\n\(note)", attributes: smallDim))
             }
         case .unavailable(let reason):
             title.append(NSAttributedString(string: reason, attributes: smallDim))
